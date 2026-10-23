@@ -1,0 +1,105 @@
+"""One manually configured HTTPS request; only encrypted responses leave stdout."""
+import base64
+import json
+import os
+import ssl
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+LIMIT = 128 * 1024
+
+
+class SafeFailure(Exception):
+    pass
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def validate_spec(raw):
+    if len(raw.encode("utf-8")) > 2 * LIMIT:
+        raise SafeFailure("input_too_large")
+    spec = json.loads(raw)
+    if not isinstance(spec, dict) or set(spec) - {"url", "method", "headers", "body"}:
+        raise SafeFailure("invalid_spec")
+    url, method, headers = spec.get("url"), spec.get("method", "GET"), spec.get("headers", {})
+    if not isinstance(url, str) or any(ord(c) < 33 for c in url):
+        raise SafeFailure("invalid_url")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.fragment:
+        raise SafeFailure("https_url_required")
+    if method not in ("GET", "POST", "PATCH") or not isinstance(headers, dict):
+        raise SafeFailure("invalid_method_or_headers")
+    for key, value in headers.items():
+        if not isinstance(key, str) or not isinstance(value, str) or not key or any(c in key + value for c in "\r\n"):
+            raise SafeFailure("invalid_headers")
+    if method == "GET" and spec.get("body") is not None:
+        raise SafeFailure("get_body_not_supported")
+    return spec
+
+
+def fetch_response(spec):
+    body = spec.get("body")
+    headers = dict(spec.get("headers", {}))
+    if body is not None and not isinstance(body, str):
+        body = json.dumps(body, separators=(",", ":"))
+        headers.setdefault("Content-Type", "application/json")
+    data = body.encode("utf-8") if body is not None else None
+    req = urllib.request.Request(spec["url"], data=data, headers=headers, method=spec.get("method", "GET"))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()), NoRedirect())
+    try:
+        response = opener.open(req, timeout=30)
+    except urllib.error.HTTPError as error:
+        response = error  # An HTTP response, including a refused redirect, is encrypted too.
+    except (urllib.error.URLError, OSError, ValueError):
+        raise SafeFailure("request_failed_outcome_unknown_do_not_retry") from None
+    with response:
+        content = response.read(LIMIT + 1)
+        if len(content) > LIMIT:
+            raise SafeFailure("response_too_large_outcome_unknown_do_not_retry")
+        return {"http_status": response.getcode(), "body": content.decode("utf-8")}
+
+
+def encrypt_response(response, certificate):
+    if len(certificate) > 64 * 1024 or "-----BEGIN CERTIFICATE-----" not in certificate or "PRIVATE KEY" in certificate:
+        raise SafeFailure("invalid_public_certificate")
+    with tempfile.TemporaryDirectory() as directory:
+        cert_path = Path(directory) / "certificate.pem"
+        cert_path.write_text(certificate, encoding="utf-8")
+        cert_path.chmod(0o600)
+        completed = subprocess.run(["openssl", "cms", "-encrypt", "-aes256", "-binary", "-outform", "DER", str(cert_path)],
+            input=json.dumps(response, separators=(",", ":")).encode("utf-8"),
+            capture_output=True, timeout=15, check=False, env={"PATH": os.environ.get("PATH", os.defpath)})
+        if completed.returncode != 0 or not completed.stdout:
+            raise SafeFailure("response_encryption_failed")
+        return base64.b64encode(completed.stdout).decode("ascii")
+
+
+def main():
+    try:
+        certificate = os.environ.get("RESPONSE_CERT", "")
+        if "-----BEGIN CERTIFICATE-----" not in certificate or "PRIVATE KEY" in certificate:
+            raise SafeFailure("public_certificate_required")
+        spec = validate_spec(os.environ.get("TASK_INPUT", ""))
+        if spec.get("method", "GET") != "GET" and os.environ.get("GITHUB_RUN_ATTEMPT", "1") != "1":
+            raise SafeFailure("mutation_rerun_disabled")
+        encrypt_response({"http_status": None, "body": ""}, certificate)  # Encryption preflight before any request.
+        print("ENCRYPTED_RESPONSE:" + encrypt_response(fetch_response(spec), certificate))
+        return 0
+    except SafeFailure as error:
+        print("RUNNER_ERROR:" + str(error))  # Fixed local codes only, never provider text.
+    except Exception:
+        print("RUNNER_ERROR:unexpected_failure_outcome_unknown_do_not_retry")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
