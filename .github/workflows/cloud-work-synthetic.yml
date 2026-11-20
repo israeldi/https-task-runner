@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/cloud-work-synthetic.yml
       - cloud-worker/**
+      - cloudflare-backup/**
 
 permissions:
   contents: read
@@ -23,6 +24,12 @@ jobs:
           persist-credentials: false
       - name: Test the synthetic worker
         run: python3 -I -B cloud-worker/test_worker.py
+      - name: Run the backup worker tests in the hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          node --test cloudflare-backup/test_worker.mjs
       - name: Verify a sample receipt
         shell: bash
         run: |
